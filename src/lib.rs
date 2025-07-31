@@ -5,6 +5,11 @@ use web_sys::{
     RtcPeerConnection, RtcSessionDescriptionInit, MessageEvent, RtcDataChannel, RtcSdpType,
 };
 use js_sys::{Object, Reflect, Array};
+use once_cell::unsync::OnceCell;
+
+thread_local! {
+    static PC_GLOBAL: OnceCell<RtcPeerConnection> = OnceCell::new();
+}
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
@@ -89,11 +94,22 @@ pub async fn run_webrtc() -> Result<JsValue, JsError> {
     Reflect::set(&result, &JsValue::from_str("sdp"), &JsValue::from_str(&sdp.sdp()))
         .map_err(log_and_convert)?;
 
-    let sdp_type = format!("{:?}", sdp.type_());
+    let sdp_type = match sdp.type_() {
+        web_sys::RtcSdpType::Offer => "offer",
+        web_sys::RtcSdpType::Answer => "answer",
+        web_sys::RtcSdpType::Pranswer => "pranswer",
+        web_sys::RtcSdpType::Rollback => "rollback",
+        _ => "offer", // fallback (safe default)
+    };
     Reflect::set(&result, &JsValue::from_str("type"), &JsValue::from_str(&sdp_type))
         .map_err(log_and_convert)?;
 
     web_sys::console::log_1(&"run_webrtc(): Finished successfully".into());
+
+    PC_GLOBAL.with(|cell| {
+        cell.set(pc.clone()).ok();
+    });
+
     Ok(result.into())
 }
 
@@ -114,4 +130,26 @@ fn log_and_convert(e: JsValue) -> JsError {
     } else {
         JsError::new("JS error (see console)")
     }
+}
+
+#[wasm_bindgen]
+pub async fn set_answer(answer_json: String) -> Result<(), JsError> {
+    let parsed: serde_json::Value = serde_json::from_str(&answer_json)
+        .map_err(|_| JsError::new("Invalid JSON"))?;
+
+    let sdp = parsed["sdp"].as_str().unwrap();
+    let mut desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
+    desc.sdp(sdp);
+
+    PC_GLOBAL.with(|cell| {
+        let pc = cell.get().expect("PeerConnection not initialized");
+        let fut = JsFuture::from(pc.set_remote_description(&desc));
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = fut.await {
+                web_sys::console::error_1(&e);
+            }
+        });
+    });
+
+    Ok(())
 }
